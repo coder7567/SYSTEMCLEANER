@@ -6,6 +6,10 @@ import hashlib
 import winreg  # Used to query Windows installed applications
 from pathlib import Path
 from datetime import datetime, timedelta
+import json
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
 
 # ==============================================================================
 # DEFENSE CLASSIFICATION MATRIX & CONFIGURATION TARGETS
@@ -38,6 +42,144 @@ GAME_SIGNATURE_FILES = {
 THREAT_THRESHOLD_BYTES = 100 * 1024 * 1024
 STALE_THRESHOLD_DAYS = 90
 LARGE_PROGRAM_THRESHOLD_GB = 2.0  # <--- Threshold for massive applications
+
+# ==============================================================================
+# AI-POWERED CLASSIFICATION & RISK ANALYSIS ENGINE SCHEMAS & UTILITIES
+# ==============================================================================
+class ThreatAnalysisItem(BaseModel):
+    id: str = Field(..., description="Unique security ID, e.g., S-1001")
+    ai_class: str = Field(..., description="Intelligent, context-aware semantic category in uppercase")
+    risk_score: int = Field(..., description="Risk score from 1 (critical asset) to 10 (delete immediately)", ge=1, le=10)
+    justification: str = Field(..., description="A single scannable sentence explaining the logic behind the score")
+
+class ThreatAnalysisResponse(BaseModel):
+    threats: List[ThreatAnalysisItem]
+
+SYSTEM_PROMPT = """You are the AI-Powered Classification & Risk Analysis Engine for Storage Defense Command.
+Your task is to analyze metadata of flagged threats on the local filesystem and refine their classification, assign a risk score, and provide a single-sentence justification.
+
+For each item, you must determine:
+1. `ai_class`: An intelligent, context-aware semantic category in uppercase (e.g., 'MALWARE_RESEARCH_WORKSPACE', 'STALE_OS_ISO_IMAGE', 'ORPHANED_BUILD_CACHE', 'DISCARDABLE_TEMP_FILES', 'STALE_DOWNLOAD_ARCHIVE').
+2. `risk_score`: An integer from 1 to 10:
+   - 10: 100% junk, delete immediately.
+   - 1: critical work/system asset, do not touch.
+3. `justification`: A single scannable sentence explaining the logic behind the score based on the file path, size, and idle times.
+
+Be precise, context-aware, and return the response exactly matching the requested schema."""
+
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+def calculate_fallback_risk_score(item):
+    score = 5
+    days = item.get("days_idle", 0)
+    h_class = item.get("heuristic_class", "")
+    
+    if days == "N/A":
+        pass
+    else:
+        try:
+            days_val = int(days)
+            if days_val > 180:
+                score += 3
+            elif days_val > 90:
+                score += 2
+            elif days_val > 30:
+                score += 1
+        except ValueError:
+            pass
+            
+    h_class_upper = h_class.upper()
+    if "_STALE" in h_class_upper:
+        score += 2
+    if "CACHE" in h_class_upper or "TEMP" in h_class_upper or "BLOAT" in h_class_upper:
+        score += 2
+    if "DUPLICATE" in h_class_upper:
+        score += 3
+    if "SYSTEM" in h_class_upper or "PROGRAM" in h_class_upper:
+        score -= 2
+        
+    return max(1, min(10, score))
+
+def analyze_threats_with_ai(threats):
+    """
+    Takes a list of threats, assigns IDs S-1001 to S-XXXX,
+    batches them (20-25 items per batch), sends them to OpenAI structured output API,
+    and returns them decorated with the AI response (ai_class, risk_score, justification).
+    Handles network/API exceptions and timeouts by falling back to local heuristic metrics.
+    """
+    # Assign IDs
+    for idx, threat in enumerate(threats, start=1001):
+        threat["id"] = f"S-{idx}"
+
+    try:
+        client = OpenAI()
+    except Exception as e:
+        print(f"\n[WARNING] Failed to initialize OpenAI client: {e}. Falling back to local heuristics.")
+        client = None
+
+    batch_size = 25
+    annotated_threats = {}
+
+    for batch in chunk_list(threats, batch_size):
+        batch_manifest = []
+        for t in batch:
+            batch_manifest.append({
+                "id": t["id"],
+                "path": t["PATH"],
+                "size_formatted": format_bytes(t["SIZE"]),
+                "days_idle": t["DAYS_IDLE"],
+                "heuristic_class": t["CLASS"]
+            })
+
+        parsed_ok = False
+        if client:
+            try:
+                print(f"[*] Dispatching batch of {len(batch)} items to AI Engine...")
+                response = client.beta.chat.completions.parse(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": json.dumps(batch_manifest)}
+                    ],
+                    response_format=ThreatAnalysisResponse,
+                    timeout=30.0
+                )
+                
+                result = response.choices[0].message.parsed
+                if result and result.threats:
+                    for item in result.threats:
+                        annotated_threats[item.id] = {
+                            "ai_class": item.ai_class,
+                            "risk_score": item.risk_score,
+                            "justification": item.justification
+                        }
+                    parsed_ok = True
+                    print(f"[SUCCESS] Received classification for batch of {len(batch)} items.")
+            except Exception as e:
+                print(f"\n[WARNING] AI analysis failed or timed out for batch: {e}. Falling back to local heuristics.")
+
+        if not parsed_ok:
+            # Local fallback for this entire batch
+            for item in batch_manifest:
+                fallback_class = item["heuristic_class"]
+                fallback_score = calculate_fallback_risk_score(item)
+                fallback_justification = f"Fallback heuristics applied. Item classified as {fallback_class} with {item['days_idle']} idle days."
+                annotated_threats[item["id"]] = {
+                    "ai_class": fallback_class,
+                    "risk_score": fallback_score,
+                    "justification": fallback_justification
+                }
+
+    # Integrate annotations back
+    for threat in threats:
+        anno = annotated_threats.get(threat["id"], {})
+        threat["ai_class"] = anno.get("ai_class", threat["CLASS"])
+        threat["risk_score"] = anno.get("risk_score", 5)
+        threat["justification"] = anno.get("justification", "No analysis metadata generated.")
+
+    return threats
 
 # DUPLICATE DETECTION CONFIG
 DUPLICATE_MIN_SIZE = 50 * 1024 * 1024
@@ -577,8 +719,12 @@ def render_tactical_display():
         # Sort by file size descending
         threats.sort(key=lambda x: x["SIZE"], reverse=True)
 
+        # Stage 2: Batch AI Parsing & Classification
+        print("[*] Starting Stage 2: Batch AI Parsing & Risk Analysis...")
+        threats = analyze_threats_with_ai(threats)
+
         out_file.write("\n" + "-" * 120 + "\n")
-        out_file.write(f"{'SEC_ID':<8} | {'CLASSIFICATION':<33} | {'DAYS_IDLE':<10} | {'CAPACITY':<13} | {'TARGET_PATH_DESCRIPTOR'}\n")
+        out_file.write(f"{'SEC_ID':<8} | {'RISK':<8} | {'AI CLASSIFICATION':<33} | {'DAYS_IDLE':<10} | {'CAPACITY':<13} | {'AI JUSTIFICATION SUMMARY'}\n")
         out_file.write("-" * 120 + "\n")
 
         culpable_space = 0
@@ -590,12 +736,12 @@ def render_tactical_display():
             path_descriptor = threat["PATH"]
 
             out_file.write(
-                f"S-{idx:<4} | {threat['CLASS']:<33} | "
+                f"S-{idx:<6} | [{threat['risk_score']:>2}/10]  | {threat['ai_class']:<33} | "
                 f"{str(threat['DAYS_IDLE']):<10} | {format_bytes(threat['SIZE']):<13} | "
-                f"{path_descriptor}\n"
+                f"{threat['justification']}\n"
+                f"  └─ Path: {path_descriptor}\n"
+                f"{'-' * 120}\n"
             )
-
-        out_file.write("-" * 120 + "\n")
         out_file.write("[STATUS] ZERO-THRESHOLD TEMPORAL RECON COMPLETE. ALL BYTES DATA-MAPPED.\n")
         out_file.write(f"[METRIC] IDENTIFIED HIGH-WASTAGE ELEMENTS: {len(threats)}\n")
         out_file.write(f"[METRIC] TOTAL SECTORS IDENTIFIED AS CRITICAL STALE (_STALE): {total_stale}\n")
@@ -608,7 +754,7 @@ def render_tactical_display():
         out_file.write(" -> Sort prioritization by evaluating 'DAYS_IDLE' matrix metrics.\n")
         out_file.write("+" + "=" * 118 + "+\n")
 
-    print(f"[✓] Scan complete! Output saved safely to '{output_filename}' without command prompt truncation.")
+    print(f"[SUCCESS] Scan complete! Output saved safely to '{output_filename}' without command prompt truncation.")
 
 
 if __name__ == "__main__":
