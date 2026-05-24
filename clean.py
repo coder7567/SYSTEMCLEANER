@@ -16,6 +16,23 @@ CACHE_MARKERS = {'cache', 'cached', 'tmp', 'temp', 'logs', 'log'}
 MEDIA_EXTENSIONS = {'.mp4', '.mp3', '.mkv', '.avi', '.mov', '.wav', '.flac', '.png', '.jpg', '.jpeg', '.gif'}
 DOCUMENT_EXTENSIONS = {'.txt', '.pdf', '.docx', '.xlsx', '.pptx', '.csv', '.md', '.log', '.bak'}
 
+GAME_MARKERS = {
+    'steamapps',
+    'epic games',
+    'riot games',
+    'battle.net',
+    'ubisoft',
+    'ea games'
+}
+
+GAME_SIGNATURE_FILES = {
+    'steam_appid.txt',
+    '.egstore',
+    'UnityPlayer.dll',
+    'data.win',
+    'pakchunk0-Windows.pak'
+}
+
 # STRATEGIC THRESHOLDS
 THREAT_THRESHOLD_BYTES = 1024 * 1024
 STALE_THRESHOLD_DAYS = 90
@@ -35,6 +52,37 @@ def stream_detection(threat, index):
         f"{path_truncate}",
         flush=True
     )
+
+def calculate_folder_metrics(folder_path):
+    """
+    Aggregates an entire directory into a single reconnaissance object.
+    """
+    total_size = 0
+    max_access = 0
+
+    try:
+        for r, d, files in os.walk(folder_path):
+            for f in files:
+                fp = os.path.join(r, f)
+
+                try:
+                    if os.path.exists(fp) and not os.path.islink(fp):
+                        stat = os.stat(fp)
+
+                        total_size += stat.st_size
+
+                        effective_use = max(stat.st_atime, stat.st_mtime)
+
+                        if effective_use > max_access:
+                            max_access = effective_use
+
+                except (PermissionError, FileNotFoundError):
+                    continue
+
+    except Exception:
+        return None
+
+    return total_size, max_access
 
 def classify_path(path_str):
     lower_path = path_str.lower()
@@ -132,6 +180,20 @@ def execute_system_reconnaissance():
     if current_os == "Windows":
         local_app = os.environ.get('LOCALAPPDATA', '')
         user_prof = os.environ.get('USERPROFILE', '')
+
+        # --- Target common game directories --- 
+        game_vectors = [
+            r"C:\Program Files (x86)\Steam\steamapps\common",
+            r"C:\Program Files\Epic Games",
+            r"C:\Program Games",
+            r"D:\SteamLibrary\steamapps\common",
+            r"D:\EpicGames"
+        ]
+        for g_path in game_vectors:
+            if os.path.exists(g_path):
+                recon_vectors.add(g_path)
+        # ------------------------------------------------
+
         recon_vectors.update([
             os.environ.get('TEMP'),
             os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'Temp'),
@@ -219,6 +281,83 @@ def execute_system_reconnaissance():
 
             dirs.remove('node_modules')
 
+        # ==========================================================
+        # GAME INSTALLATION FOLDER AGGREGATION
+        # ==========================================================
+        game_dirs_to_remove = []
+
+        for d in dirs:
+            lower_dir = d.lower()
+
+            # Skip engine/runtime folders
+            if lower_dir in {
+                'commonredist',
+                '_commonredist',
+                'directx',
+                'redistributables'
+            }:
+                continue
+
+            full_game_path = os.path.join(root, d)
+
+            # Safely check files inside this specific directory to catch loose signatures
+            has_signature_file = False
+            try:
+                if os.path.isdir(full_game_path):
+                    sub_files = os.listdir(full_game_path)
+                    if any(sig in sub_files for sig in GAME_SIGNATURE_FILES):
+                        has_signature_file = True
+            except Exception:
+                pass
+
+            # Detect if current path appears to be a game library OR contains signature files
+            if any(marker in root.lower() for marker in GAME_MARKERS) or has_signature_file:
+
+                try:
+                    result = calculate_folder_metrics(full_game_path)
+
+                    if result is None:
+                        continue
+
+                    folder_size, max_access = result
+
+                    if folder_size >= THREAT_THRESHOLD_BYTES:
+
+                        idle_sec = now_ts - max_access
+                        days_idle = int(idle_sec / (24 * 60 * 60))
+
+                        classification = "GAME_INSTALLATION_BLOCK"
+
+                        if idle_sec >= stale_delta_sec:
+                            classification += "_STALE"
+                            stale_count += 1
+
+                        discovered_threats.append({
+                            "PATH": full_game_path,
+                            "SIZE": folder_size,
+                            "CLASS": classification,
+                            "DAYS_IDLE": max(0, days_idle)
+                        })
+
+                        stream_detection(
+                            discovered_threats[-1],
+                            len(discovered_threats)
+                        )
+
+                        total_bytes_scanned += folder_size
+
+                        # Prevent descending into the game directory
+                        game_dirs_to_remove.append(d)
+
+                except Exception:
+                    pass
+
+        # Remove aggregated game folders from os.walk recursion
+        for g in game_dirs_to_remove:
+            if g in dirs:
+                dirs.remove(g)
+
+        # --- Individual File Scan ---
         for file in files:
             file_path = os.path.join(root, file)
             try:
