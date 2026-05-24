@@ -7,7 +7,8 @@ import winreg  # Used to query Windows installed applications
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
-from openai import OpenAI
+import asyncio
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
@@ -102,42 +103,27 @@ def calculate_fallback_risk_score(item):
         
     return max(1, min(10, score))
 
-def analyze_threats_with_ai(threats):
-    """
-    Takes a list of threats, assigns IDs S-1001 to S-XXXX,
-    batches them (20-25 items per batch), sends them to OpenAI structured output API,
-    and returns them decorated with the AI response (ai_class, risk_score, justification).
-    Handles network/API exceptions and timeouts by falling back to local heuristic metrics.
-    """
-    # Assign IDs
-    for idx, threat in enumerate(threats, start=1001):
-        threat["id"] = f"S-{idx}"
+async def analyze_batch_async(client, batch, semaphore):
+    # build the manifest
+    batch_manifest = []
+    for t in batch:
+        batch_manifest.append({
+            "id": t["id"],
+            "path": t["PATH"],
+            "size_formatted": format_bytes(t["SIZE"]),
+            "days_idle": t["DAYS_IDLE"],
+            "heuristic_class": t["CLASS"]
+        })
 
-    try:
-        client = OpenAI()
-    except Exception as e:
-        print(f"\n[WARNING] Failed to initialize OpenAI client: {e}. Falling back to local heuristics.")
-        client = None
+    annotated_batch = {}
+    parsed_ok = False
 
-    batch_size = 25
-    annotated_threats = {}
-
-    for batch in chunk_list(threats, batch_size):
-        batch_manifest = []
-        for t in batch:
-            batch_manifest.append({
-                "id": t["id"],
-                "path": t["PATH"],
-                "size_formatted": format_bytes(t["SIZE"]),
-                "days_idle": t["DAYS_IDLE"],
-                "heuristic_class": t["CLASS"]
-            })
-
-        parsed_ok = False
-        if client:
+    if client:
+        # Acquire semaphore to enforce rate limits (max 5 concurrent calls)
+        async with semaphore:
             try:
-                print(f"[*] Dispatching batch of {len(batch)} items to AI Engine...")
-                response = client.beta.chat.completions.parse(
+                print(f"[*] Dispatching batch of {len(batch)} items to AI Engine concurrently...")
+                response = await client.beta.chat.completions.parse(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
@@ -150,7 +136,7 @@ def analyze_threats_with_ai(threats):
                 result = response.choices[0].message.parsed
                 if result and result.threats:
                     for item in result.threats:
-                        annotated_threats[item.id] = {
+                        annotated_batch[item.id] = {
                             "ai_class": item.ai_class,
                             "risk_score": item.risk_score,
                             "justification": item.justification
@@ -160,17 +146,52 @@ def analyze_threats_with_ai(threats):
             except Exception as e:
                 print(f"\n[WARNING] AI analysis failed or timed out for batch: {e}. Falling back to local heuristics.")
 
-        if not parsed_ok:
-            # Local fallback for this entire batch
-            for item in batch_manifest:
-                fallback_class = item["heuristic_class"]
-                fallback_score = calculate_fallback_risk_score(item)
-                fallback_justification = f"Fallback heuristics applied. Item classified as {fallback_class} with {item['days_idle']} idle days."
-                annotated_threats[item["id"]] = {
-                    "ai_class": fallback_class,
-                    "risk_score": fallback_score,
-                    "justification": fallback_justification
-                }
+    if not parsed_ok:
+        # Local fallback for this specific batch
+        for item in batch_manifest:
+            fallback_class = item["heuristic_class"]
+            fallback_score = calculate_fallback_risk_score(item)
+            fallback_justification = f"Fallback heuristics applied. Item classified as {fallback_class} with {item['days_idle']} idle days."
+            annotated_batch[item["id"]] = {
+                "ai_class": fallback_class,
+                "risk_score": fallback_score,
+                "justification": fallback_justification
+            }
+            
+    return annotated_batch
+
+async def analyze_threats_with_ai_async(threats):
+    """
+    Takes a list of threats, assigns IDs S-1001 to S-XXXX,
+    batches them (20-25 items per batch), sends them to OpenAI structured output API concurrently,
+    and returns them decorated with the AI response (ai_class, risk_score, justification).
+    Handles network/API exceptions and timeouts on a per-batch basis by falling back to local heuristics.
+    """
+    # Assign IDs
+    for idx, threat in enumerate(threats, start=1001):
+        threat["id"] = f"S-{idx}"
+
+    try:
+        client = AsyncOpenAI()
+    except Exception as e:
+        print(f"\n[WARNING] Failed to initialize AsyncOpenAI client: {e}. Falling back to local heuristics.")
+        client = None
+
+    semaphore = asyncio.Semaphore(5)
+    batch_size = 25
+    
+    batches = list(chunk_list(threats, batch_size))
+    
+    # Create tasks for all batches
+    tasks = [analyze_batch_async(client, batch, semaphore) for batch in batches]
+    
+    # Run tasks concurrently
+    results = await asyncio.gather(*tasks)
+    
+    # Combine results
+    annotated_threats = {}
+    for res in results:
+        annotated_threats.update(res)
 
     # Integrate annotations back
     for threat in threats:
@@ -719,9 +740,9 @@ def render_tactical_display():
         # Sort by file size descending
         threats.sort(key=lambda x: x["SIZE"], reverse=True)
 
-        # Stage 2: Batch AI Parsing & Classification
-        print("[*] Starting Stage 2: Batch AI Parsing & Risk Analysis...")
-        threats = analyze_threats_with_ai(threats)
+        # Stage 2: Batch Async AI Parsing & Classification
+        print("[*] Starting Stage 2: Concurrent Batch AI Parsing & Risk Analysis...")
+        threats = asyncio.run(analyze_threats_with_ai_async(threats))
 
         out_file.write("\n" + "-" * 120 + "\n")
         out_file.write(f"{'SEC_ID':<8} | {'RISK':<8} | {'AI CLASSIFICATION':<33} | {'DAYS_IDLE':<10} | {'CAPACITY':<13} | {'AI JUSTIFICATION SUMMARY'}\n")
