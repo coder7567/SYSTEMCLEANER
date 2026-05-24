@@ -34,11 +34,13 @@ GAME_SIGNATURE_FILES = {
 }
 
 # STRATEGIC THRESHOLDS
-THREAT_THRESHOLD_BYTES = 1024 * 1024
+THREAT_THRESHOLD_BYTES = 100 * 1024 * 1024
 STALE_THRESHOLD_DAYS = 90
 LARGE_PROGRAM_THRESHOLD_GB = 2.0  # <--- Threshold for massive applications
 
-def stream_detection(threat, index):
+
+def stream_detection(threat, index, out_file):
+    """Writes live detections straight to the file instead of the terminal."""
     path_truncate = threat["PATH"]
 
     if len(path_truncate) > 70:
@@ -50,8 +52,18 @@ def stream_detection(threat, index):
         f"{format_bytes(threat['SIZE']):<12} | "
         f"{threat['DAYS_IDLE']:<8} days | "
         f"{path_truncate}",
+        file=out_file,
         flush=True
     )
+
+def is_excluded(path, excluded_roots):
+    norm = os.path.normpath(path)
+
+    for ex in excluded_roots:
+        if norm.startswith(ex):
+            return True
+
+    return False
 
 def calculate_folder_metrics(folder_path):
     """
@@ -83,6 +95,7 @@ def calculate_folder_metrics(folder_path):
         return None
 
     return total_size, max_access
+
 
 def classify_path(path_str):
     lower_path = path_str.lower()
@@ -118,7 +131,6 @@ def fetch_large_installed_programs():
     if platform.system() != "Windows":
         return large_apps
 
-    # Paths inside Windows registry where uninstall information is stored
     reg_paths = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
@@ -137,20 +149,18 @@ def fetch_large_installed_programs():
                             try:
                                 name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
                                 try:
-                                    # EstimatedSize is recorded in KB by Windows
                                     size_kb, _ = winreg.QueryValueEx(sub_key, "EstimatedSize")
                                     size_bytes = size_kb * 1024
                                 except FileNotFoundError:
                                     continue
                                 
                                 if size_bytes >= threshold_bytes:
-                                    # Avoid adding duplicate application entries
                                     if not any(a["PATH"] == name for a in large_apps):
                                         large_apps.append({
                                             "PATH": name,
                                             "SIZE": size_bytes,
                                             "CLASS": "MONOLITHIC_APPLICATION_HOST",
-                                            "DAYS_IDLE": "N/A"  # Windows registry does not reliably track days idle
+                                            "DAYS_IDLE": "N/A"
                                         })
                             except FileNotFoundError:
                                 pass
@@ -162,13 +172,14 @@ def fetch_large_installed_programs():
     return large_apps
 
 
-def execute_system_reconnaissance():
-    print("[*] INITIALIZING CHRONO-TACTICAL STORAGE RECONNAISSANCE...")
-    print(f"[*] TARGET ARCHITECTURE: {platform.system().upper()} {platform.machine()}")
-    print(f"[*] TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[-] AGE TARGET CRITERIA: UNUSED/UNOPENED FOR >= {STALE_THRESHOLD_DAYS} DAYS")
-    print(f"[-] APP SIZE BOUNDARY: SCANNING FOR APPLICATIONS >= {LARGE_PROGRAM_THRESHOLD_GB} GB")
-    print("[-] PARSING FILE SYSTEM NODES WITH TEMPORAL METRICS... STAND BY.")
+def execute_system_reconnaissance(out_file):
+    """Runs data collection and redirects target metadata directly into the output file object."""
+    print("[*] INITIALIZING STORAGE RECONNAISSANCE...", file=out_file)
+    print(f"[*] TARGET ARCHITECTURE: {platform.system().upper()} {platform.machine()}", file=out_file)
+    print(f"[*] TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", file=out_file)
+    print(f"[-] AGE TARGET CRITERIA: UNUSED/UNOPENED FOR >= {STALE_THRESHOLD_DAYS} DAYS", file=out_file)
+    print(f"[-] APP SIZE BOUNDARY: SCANNING FOR APPLICATIONS >= {LARGE_PROGRAM_THRESHOLD_GB} GB", file=out_file)
+    print("[-] PARSING FILE SYSTEM NODES... STAND BY.", file=out_file)
 
     home_dir = str(Path.home())
     current_os = platform.system()
@@ -176,12 +187,12 @@ def execute_system_reconnaissance():
     stale_delta_sec = STALE_THRESHOLD_DAYS * 24 * 60 * 60
 
     recon_vectors = set()
+    excluded_roots = set()
 
     if current_os == "Windows":
         local_app = os.environ.get('LOCALAPPDATA', '')
         user_prof = os.environ.get('USERPROFILE', '')
 
-        # --- Target common game directories --- 
         game_vectors = [
             r"C:\Program Files (x86)\Steam\steamapps\common",
             r"C:\Program Files\Epic Games",
@@ -192,7 +203,6 @@ def execute_system_reconnaissance():
         for g_path in game_vectors:
             if os.path.exists(g_path):
                 recon_vectors.add(g_path)
-        # ------------------------------------------------
 
         recon_vectors.update([
             os.environ.get('TEMP'),
@@ -229,16 +239,15 @@ def execute_system_reconnaissance():
     total_bytes_scanned = 0
     stale_count = 0
 
-    # 1. Fetch Windows massive application installations
     if current_os == "Windows":
         app_threats = fetch_large_installed_programs()
         discovered_threats.extend(app_threats)
-        # Add to total space metrics
         for app in app_threats:
             total_bytes_scanned += app["SIZE"]
 
-    # 2. File System Scan
     for root, dirs, files in os.walk(home_dir):
+        if is_excluded(root, excluded_roots):
+            continue
         if any(p in root for p in ['.git', '$Recycle.Bin', 'System Volume Information']):
             continue
 
@@ -272,8 +281,9 @@ def execute_system_reconnaissance():
                         "DAYS_IDLE": last_used_days
                     })
 
-                    stream_detection(discovered_threats[-1], len(discovered_threats))
+                    excluded_roots.add(os.path.normpath(full_game_path))
 
+                    stream_detection(discovered_threats[-1], len(discovered_threats), out_file)
                     total_bytes_scanned += folder_size
 
             except Exception:
@@ -281,26 +291,14 @@ def execute_system_reconnaissance():
 
             dirs.remove('node_modules')
 
-        # ==========================================================
-        # GAME INSTALLATION FOLDER AGGREGATION
-        # ==========================================================
         game_dirs_to_remove = []
 
         for d in dirs:
             lower_dir = d.lower()
-
-            # Skip engine/runtime folders
-            if lower_dir in {
-                'commonredist',
-                '_commonredist',
-                'directx',
-                'redistributables'
-            }:
+            if lower_dir in {'commonredist', '_commonredist', 'directx', 'redistributables'}:
                 continue
 
             full_game_path = os.path.join(root, d)
-
-            # Safely check files inside this specific directory to catch loose signatures
             has_signature_file = False
             try:
                 if os.path.isdir(full_game_path):
@@ -310,22 +308,17 @@ def execute_system_reconnaissance():
             except Exception:
                 pass
 
-            # Detect if current path appears to be a game library OR contains signature files
             if any(marker in root.lower() for marker in GAME_MARKERS) or has_signature_file:
-
                 try:
                     result = calculate_folder_metrics(full_game_path)
-
                     if result is None:
                         continue
 
                     folder_size, max_access = result
 
                     if folder_size >= THREAT_THRESHOLD_BYTES:
-
                         idle_sec = now_ts - max_access
                         days_idle = int(idle_sec / (24 * 60 * 60))
-
                         classification = "GAME_INSTALLATION_BLOCK"
 
                         if idle_sec >= stale_delta_sec:
@@ -339,25 +332,17 @@ def execute_system_reconnaissance():
                             "DAYS_IDLE": max(0, days_idle)
                         })
 
-                        stream_detection(
-                            discovered_threats[-1],
-                            len(discovered_threats)
-                        )
-
+                        stream_detection(discovered_threats[-1], len(discovered_threats), out_file)
                         total_bytes_scanned += folder_size
-
-                        # Prevent descending into the game directory
                         game_dirs_to_remove.append(d)
 
                 except Exception:
                     pass
 
-        # Remove aggregated game folders from os.walk recursion
         for g in game_dirs_to_remove:
             if g in dirs:
                 dirs.remove(g)
 
-        # --- Individual File Scan ---
         for file in files:
             file_path = os.path.join(root, file)
             try:
@@ -390,16 +375,17 @@ def execute_system_reconnaissance():
             except (PermissionError, FileNotFoundError):
                 continue
 
-    
     existing_paths = {t["PATH"] for t in discovered_threats}
 
     for vector in filter(None, recon_vectors):
         if os.path.exists(vector) and os.path.isdir(vector):
             try:
                 for root, _, files in os.walk(vector):
+                    if is_excluded(root, excluded_roots):
+                        continue
                     for file in files:
                         fp = os.path.join(root, file)
-                        if fp not in existing_paths: # O(1) lookup — instant!
+                        if fp not in existing_paths:
                             if os.path.exists(fp) and not os.path.islink(fp):
                                 f_stat = os.stat(fp)
                                 f_size = f_stat.st_size
@@ -428,49 +414,54 @@ def execute_system_reconnaissance():
 
 
 def render_tactical_display():
-    # Subtle platform handling for screen clears
-    os.system('cls' if platform.system() == 'Windows' else 'clear')
+    output_filename = "storage_recon_report.txt"
+    
+    # Notify user on the command prompt that something is actually happening
+    print(f"[*] Starting system scan. Writing all records to: {output_filename}")
+    print("[*] Processing... please wait.")
 
-    print("+" + "=" * 118 + "+")
-    print(f"| CHRONO-TACTICAL DEEP SCAN OPERATIONAL REPORT: ZERO-THRESHOLD STORAGE DEFENSE COMMAND{' ' * 25}|")
-    print("+" + "=" * 118 + "+")
+    with open(output_filename, "w", encoding="utf-8") as out_file:
+        out_file.write("+" + "=" * 118 + "+\n")
+        out_file.write(f"| CHRONO-TACTICAL DEEP SCAN OPERATIONAL REPORT: STORAGE DEFENSE COMMAND{' ' * 38}|\n")
+        out_file.write("+" + "=" * 118 + "+\n")
 
-    threats, total_scanned, total_stale = execute_system_reconnaissance()
+        threats, total_scanned, total_stale = execute_system_reconnaissance(out_file)
 
-    # Sort everything by size descending so giant entries bubble straight to the top
-    threats.sort(key=lambda x: x["SIZE"], reverse=True)
+        # Sort by file size descending
+        threats.sort(key=lambda x: x["SIZE"], reverse=True)
 
-    print("\n" + "-" * 120)
-    print(f"{'SEC_ID':<8} | {'CLASSIFICATION':<33} | {'DAYS_IDLE':<10} | {'CAPACITY':<13} | {'TARGET_PATH_DESCRIPTOR'}")
-    print("-" * 120)
+        out_file.write("\n" + "-" * 120 + "\n")
+        out_file.write(f"{'SEC_ID':<8} | {'CLASSIFICATION':<33} | {'DAYS_IDLE':<10} | {'CAPACITY':<13} | {'TARGET_PATH_DESCRIPTOR'}\n")
+        out_file.write("-" * 120 + "\n")
 
-    culpable_space = 0
+        culpable_space = 0
 
-    for idx, threat in enumerate(threats, start=1001):
-        culpable_space += threat["SIZE"]
+        for idx, threat in enumerate(threats, start=1001):
+            culpable_space += threat["SIZE"]
+            
+            # Left path completely un-truncated so you don't lose information in the file
+            path_descriptor = threat["PATH"]
 
-        path_truncate = threat["PATH"]
-        if len(path_truncate) > 46:
-            path_truncate = f"...{path_truncate[-43:]}"
+            out_file.write(
+                f"S-{idx:<4} | {threat['CLASS']:<33} | "
+                f"{str(threat['DAYS_IDLE']):<10} | {format_bytes(threat['SIZE']):<13} | "
+                f"{path_descriptor}\n"
+            )
 
-        print(
-            f"S-{idx:<4} | {threat['CLASS']:<33} | "
-            f"{str(threat['DAYS_IDLE']):<10} | {format_bytes(threat['SIZE']):<13} | "
-            f"{path_truncate}"
-        )
+        out_file.write("-" * 120 + "\n")
+        out_file.write("[STATUS] ZERO-THRESHOLD TEMPORAL RECON COMPLETE. ALL BYTES DATA-MAPPED.\n")
+        out_file.write(f"[METRIC] IDENTIFIED HIGH-WASTAGE ELEMENTS: {len(threats)}\n")
+        out_file.write(f"[METRIC] TOTAL SECTORS IDENTIFIED AS CRITICAL STALE (_STALE): {total_stale}\n")
+        out_file.write(f"[METRIC] GROSS PURGEABLE CAPABILITY: {format_bytes(culpable_space)}\n")
+        out_file.write("+" + "=" * 118 + "+\n")
 
-    print("-" * 120)
-    print("[STATUS] ZERO-THRESHOLD TEMPORAL RECON COMPLETE. EVERY ACCUMULATED BYTE RE-INDEXED.")
-    print(f"[METRIC] IDENTIFIED HIGH-WASTAGE ELEMENTS: {len(threats)}")
-    print(f"[METRIC] TOTAL SECTORS IDENTIFIED AS CRITICAL STALE (_STALE): {total_stale}")
-    print(f"[METRIC] GROSS PURGEABLE CAPABILITY: {format_bytes(culpable_space)}")
-    print("+" + "=" * 118 + "+")
+        out_file.write("\n[!] INTERVENTION TARGET RULES:\n")
+        out_file.write(" -> Look for classifications appending '_STALE'.\n")
+        out_file.write(" -> MONOLITHIC_APPLICATION_HOST targets denote large apps tracked directly from OS installation nodes.\n")
+        out_file.write(" -> Sort prioritization by evaluating 'DAYS_IDLE' matrix metrics.\n")
+        out_file.write("+" + "=" * 118 + "+\n")
 
-    print("\n[!] INTERVENTION TARGET RULES:")
-    print(" -> Look for classifications appending '_STALE'. These elements have not been accessed within configuration bounds.")
-    print(" -> MONOLITHIC_APPLICATION_HOST targets denote large apps tracked directly from OS installation nodes.")
-    print(" -> Sort prioritization by evaluating 'DAYS_IDLE' matrix metrics. High numbers mean high discard safety.")
-    print("+" + "=" * 118 + "+")
+    print(f"[✓] Scan complete! Output saved safely to '{output_filename}' without command prompt truncation.")
 
 
 if __name__ == "__main__":
