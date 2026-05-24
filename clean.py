@@ -2,6 +2,7 @@ import os
 import sys
 import platform
 import time
+import hashlib
 import winreg  # Used to query Windows installed applications
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -38,6 +39,9 @@ THREAT_THRESHOLD_BYTES = 100 * 1024 * 1024
 STALE_THRESHOLD_DAYS = 90
 LARGE_PROGRAM_THRESHOLD_GB = 2.0  # <--- Threshold for massive applications
 
+# DUPLICATE DETECTION CONFIG
+DUPLICATE_MIN_SIZE = 50 * 1024 * 1024
+HASH_CHUNK_SIZE = 1024 * 256  
 
 def stream_detection(threat, index, out_file):
     """Writes live detections straight to the file instead of the terminal."""
@@ -55,6 +59,23 @@ def stream_detection(threat, index, out_file):
         file=out_file,
         flush=True
     )
+
+def quick_file_hash(path, chunk_size=HASH_CHUNK_SIZE):
+    """
+    Fast partial SHA-256 hash.
+    Reads only the beginning of the file for speed.
+    """
+    sha = hashlib.sha256()
+
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(chunk_size)
+            sha.update(chunk)
+
+        return sha.hexdigest()
+
+    except Exception:
+        return None
 
 def is_excluded(path, excluded_roots):
     norm = os.path.normpath(path)
@@ -171,7 +192,6 @@ def fetch_large_installed_programs():
             
     return large_apps
 
-
 def execute_system_reconnaissance(out_file):
     """Runs data collection and redirects target metadata directly into the output file object."""
     print("[*] INITIALIZING STORAGE RECONNAISSANCE...", file=out_file)
@@ -181,6 +201,11 @@ def execute_system_reconnaissance(out_file):
     print(f"[-] APP SIZE BOUNDARY: SCANNING FOR APPLICATIONS >= {LARGE_PROGRAM_THRESHOLD_GB} GB", file=out_file)
     print("[-] PARSING FILE SYSTEM NODES... STAND BY.", file=out_file)
 
+    scanned_files = 0
+    scanned_dirs = 0
+    start_time = time.time()
+    last_progress_update = time.time()
+
     home_dir = str(Path.home())
     current_os = platform.system()
     now_ts = time.time()
@@ -188,6 +213,9 @@ def execute_system_reconnaissance(out_file):
 
     recon_vectors = set()
     excluded_roots = set()
+
+    size_registry = {}
+    duplicate_registry = {}
 
     if current_os == "Windows":
         local_app = os.environ.get('LOCALAPPDATA', '')
@@ -246,6 +274,7 @@ def execute_system_reconnaissance(out_file):
             total_bytes_scanned += app["SIZE"]
 
     for root, dirs, files in os.walk(home_dir):
+        scanned_dirs += 1
         if is_excluded(root, excluded_roots):
             continue
         if any(p in root for p in ['.git', '$Recycle.Bin', 'System Volume Information']):
@@ -281,7 +310,7 @@ def execute_system_reconnaissance(out_file):
                         "DAYS_IDLE": last_used_days
                     })
 
-                    excluded_roots.add(os.path.normpath(full_game_path))
+                    excluded_roots.add(os.path.normpath(nm_path))
 
                     stream_detection(discovered_threats[-1], len(discovered_threats), out_file)
                     total_bytes_scanned += folder_size
@@ -344,12 +373,59 @@ def execute_system_reconnaissance(out_file):
                 dirs.remove(g)
 
         for file in files:
+            scanned_files += 1
             file_path = os.path.join(root, file)
             try:
                 if os.path.exists(file_path) and not os.path.islink(file_path):
                     f_stat = os.stat(file_path)
                     f_size = f_stat.st_size
                     total_bytes_scanned += f_size
+
+                    # ======================================================
+                    # LIVE TERMINAL PROGRESS TRACKING
+                    # ======================================================
+                    current_time = time.time()
+
+                    if current_time - last_progress_update >= 1.0:
+                        scan_rate = scanned_files / max(1, (current_time - start_time))
+                        sys.stdout.write(
+                            f"\r[*] SCANNING | "
+                            f"Files: {scanned_files:,} | "
+                            f"Dirs: {scanned_dirs:,} | "
+                            f"Data: {format_bytes(total_bytes_scanned)} | "
+                            f"Threats: {len(discovered_threats)} | "
+                            f"Rate: {int(scan_rate):,} files/sec | "
+                        )
+
+                        sys.stdout.flush()
+                        last_progress_update = current_time
+
+                    # ==========================================================
+                    # DUPLICATE FILE DETECTION (Insertion Point 1)
+                    # ==========================================================
+                    if f_size >= DUPLICATE_MIN_SIZE:
+
+                        if f_size not in size_registry:
+                            size_registry[f_size] = [file_path]
+
+                        else:
+                            current_hash = quick_file_hash(file_path)
+
+                            if current_hash:
+
+                                if current_hash not in duplicate_registry:
+                                    duplicate_registry[current_hash] = []
+
+                                    # Hash previous same-sized files
+                                    for existing_path in size_registry[f_size]:
+                                        existing_hash = quick_file_hash(existing_path)
+
+                                        if existing_hash == current_hash:
+                                            duplicate_registry[current_hash].append(existing_path)
+
+                                duplicate_registry[current_hash].append(file_path)
+
+                            size_registry[f_size].append(file_path)
 
                     if f_size >= THREAT_THRESHOLD_BYTES:
                         last_access = f_stat.st_atime
@@ -381,15 +457,63 @@ def execute_system_reconnaissance(out_file):
         if os.path.exists(vector) and os.path.isdir(vector):
             try:
                 for root, _, files in os.walk(vector):
+                    scanned_dirs += 1
                     if is_excluded(root, excluded_roots):
                         continue
                     for file in files:
+                        scanned_files += 1
                         fp = os.path.join(root, file)
                         if fp not in existing_paths:
                             if os.path.exists(fp) and not os.path.islink(fp):
                                 f_stat = os.stat(fp)
                                 f_size = f_stat.st_size
                                 total_bytes_scanned += f_size
+
+                                # ======================================================
+                                # LIVE TERMINAL PROGRESS TRACKING
+                                # ======================================================
+                                current_time = time.time()
+
+                                if current_time - last_progress_update >= 1.0:
+                                    scan_rate = scanned_files / max(1, (current_time - start_time))
+                                    sys.stdout.write(
+                                        f"\r[*] SCANNING | "
+                                        f"Files: {scanned_files:,} | "
+                                        f"Dirs: {scanned_dirs:,} | "
+                                        f"Data: {format_bytes(total_bytes_scanned)} | "
+                                        f"Threats: {len(discovered_threats)} | "
+                                        f"Rate: {int(scan_rate):,} files/sec | "
+                                    )
+
+                                    sys.stdout.flush()
+                                    last_progress_update = current_time
+
+                                # ==========================================================
+                                # DUPLICATE FILE DETECTION (Insertion Point 2)
+                                # ==========================================================
+                                if f_size >= DUPLICATE_MIN_SIZE:
+
+                                    if f_size not in size_registry:
+                                        size_registry[f_size] = [fp]
+
+                                    else:
+                                        current_hash = quick_file_hash(fp)
+
+                                        if current_hash:
+
+                                            if current_hash not in duplicate_registry:
+                                                duplicate_registry[current_hash] = []
+
+                                                # Hash previous same-sized files
+                                                for existing_path in size_registry[f_size]:
+                                                    existing_hash = quick_file_hash(existing_path)
+
+                                                    if existing_hash == current_hash:
+                                                        duplicate_registry[current_hash].append(existing_path)
+
+                                            duplicate_registry[current_hash].append(fp)
+
+                                        size_registry[f_size].append(fp)
 
                                 if f_size >= THREAT_THRESHOLD_BYTES:
                                     eff_use = max(f_stat.st_atime, f_stat.st_mtime)
@@ -410,6 +534,29 @@ def execute_system_reconnaissance(out_file):
             except Exception:
                 continue
 
+    # ==========================================================
+    # DUPLICATE CONSOLIDATION (Final Placement Node)
+    # ==========================================================
+    for file_hash, paths in duplicate_registry.items():
+
+        unique_paths = list(set(paths))
+
+        if len(unique_paths) > 1:
+
+            try:
+                duplicate_size = os.path.getsize(unique_paths[0])
+
+                discovered_threats.append({
+                    "PATH": " | ".join(unique_paths[:3]),
+                    "SIZE": duplicate_size * len(unique_paths),
+                    "CLASS": f"DUPLICATE_FILE_CLUSTER x{len(unique_paths)}",
+                    "DAYS_IDLE": "N/A"
+                })
+
+            except Exception:
+                pass
+
+    print()
     return discovered_threats, total_bytes_scanned, stale_count
 
 
